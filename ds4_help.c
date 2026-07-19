@@ -318,6 +318,11 @@ static void print_server_api(FILE *fp, const help_colors *c) {
     para(fp, c, "Endpoints: /v1/chat/completions, /v1/responses, /v1/completions, and /v1/messages.");
     para(fp, c, "Model endpoint aliases include deepseek-v4-flash and deepseek-v4-pro; both serve the loaded GGUF.");
     fputc('\n', fp);
+    title(fp, c, "Remote INFER (DS4I)");
+    opt(fp, c, "--listen-infer EP", "Serve the raw-completion INFER protocol on host:port or unix:/path.");
+    para(fp, c, "Requires --kv-disk-dir and --kv-cache-hash fnv1a64; clients address cached prefixes by text hash.");
+    para(fp, c, "No authentication: trusted networks or unix sockets only. See INFER_PROTOCOL.md.");
+    fputc('\n', fp);
 }
 
 static void print_server_thinking(FILE *fp, const help_colors *c) {
@@ -340,6 +345,7 @@ static void print_kv_cache(FILE *fp, const help_colors *c) {
     opt(fp, c, "--kv-cache-boundary-trim-tokens N", "Trim tail tokens for cold boundary saves. Default: 32");
     opt(fp, c, "--kv-cache-boundary-align-tokens N", "Align cold boundary saves to this multiple. Default: 2048");
     opt(fp, c, "--kv-cache-reject-different-quant", "Reject checkpoints written with different routed-expert quantization.");
+    opt(fp, c, "--kv-cache-hash KIND", "Cache key hash: sha1 (default) or fnv1a64. INFER needs fnv1a64.");
     opt(fp, c, "--disable-exact-dsml-tool-replay", "Disable exact sampled DSML tool replay map.");
     opt(fp, c, "--tool-memory-max-ids N", "Exact tool-call IDs kept in RAM. Default: 100000");
     fputc('\n', fp);

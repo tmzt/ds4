@@ -168,6 +168,7 @@ ds4_kvstore_options ds4_kvstore_default_options(void) {
         .continued_interval_tokens = KV_CACHE_DEFAULT_CONTINUED_INTERVAL_TOKENS,
         .boundary_trim_tokens = KV_CACHE_DEFAULT_BOUNDARY_TRIM_TOKENS,
         .boundary_align_tokens = KV_CACHE_DEFAULT_BOUNDARY_ALIGN_TOKENS,
+        .hash_kind = DS4_KVSTORE_HASH_SHA1,
     };
 }
 
@@ -327,14 +328,51 @@ void ds4_kvstore_sha1_bytes_hex(const void *ptr, size_t len, char out[41]) {
     hex20(digest, out);
 }
 
-bool ds4_kvstore_sha_hex_name(const char *name, char sha[41]) {
-    if (strlen(name) != 43 || strcmp(name + 40, ".kv")) return false;
-    for (int i = 0; i < 40; i++) {
-        if (!isxdigit((unsigned char)name[i])) return false;
-        sha[i] = (char)tolower((unsigned char)name[i]);
+uint64_t ds4_kvstore_fnv1a64_bytes(const void *ptr, size_t len) {
+    const uint8_t *p = ptr;
+    uint64_t h = 0xcbf29ce484222325ull;
+    for (size_t i = 0; i < len; i++) {
+        h ^= p[i];
+        h *= 0x100000001b3ull;
     }
-    sha[40] = '\0';
+    return h;
+}
+
+void ds4_kvstore_fnv1a64_bytes_hex(const void *ptr, size_t len, char out[41]) {
+    snprintf(out, 41, "%016llx",
+             (unsigned long long)ds4_kvstore_fnv1a64_bytes(ptr, len));
+}
+
+void ds4_kvstore_hash_bytes_hex(int hash_kind, const void *ptr, size_t len,
+                                char out[41]) {
+    if (hash_kind == DS4_KVSTORE_HASH_FNV1A64)
+        ds4_kvstore_fnv1a64_bytes_hex(ptr, len, out);
+    else
+        ds4_kvstore_sha1_bytes_hex(ptr, len, out);
+}
+
+ds4_kvstore_hash_kind ds4_kvstore_key_hash_kind(const char *key) {
+    return strlen(key) == 16 ? DS4_KVSTORE_HASH_FNV1A64
+                             : DS4_KVSTORE_HASH_SHA1;
+}
+
+static bool kv_hex_name_kind(const char *name, size_t hex_len, char key[41]) {
+    if (strlen(name) != hex_len + 3 || strcmp(name + hex_len, ".kv"))
+        return false;
+    for (size_t i = 0; i < hex_len; i++) {
+        if (!isxdigit((unsigned char)name[i])) return false;
+        key[i] = (char)tolower((unsigned char)name[i]);
+    }
+    memset(key + hex_len, 0, 41 - hex_len);
     return true;
+}
+
+bool ds4_kvstore_sha_hex_name(const char *name, char sha[41]) {
+    return kv_hex_name_kind(name, 40, sha);
+}
+
+bool ds4_kvstore_hash_hex_name(const char *name, char key[41]) {
+    return kv_hex_name_kind(name, 40, key) || kv_hex_name_kind(name, 16, key);
 }
 
 char *ds4_kvstore_path_join(const char *dir, const char *name) {
@@ -347,8 +385,9 @@ char *ds4_kvstore_path_join(const char *dir, const char *name) {
 
 char *ds4_kvstore_path_for_sha(ds4_kvstore *kc, const char sha[41]) {
     char name[44];
-    memcpy(name, sha, 40);
-    memcpy(name + 40, ".kv", 4);
+    const size_t hex_len = strlen(sha); /* 40 (sha1) or 16 (fnv1a64) */
+    memcpy(name, sha, hex_len);
+    memcpy(name + hex_len, ".kv", 4);
     return ds4_kvstore_path_join(kc->dir, name);
 }
 
@@ -473,7 +512,9 @@ static void kv_cache_refresh(ds4_kvstore *kc) {
     struct dirent *de;
     while ((de = readdir(d)) != NULL) {
         char sha[41];
-        if (!ds4_kvstore_sha_hex_name(de->d_name, sha)) continue;
+        /* Accept both key shapes regardless of the configured hash kind so
+         * budget accounting and eviction always see every real cache file. */
+        if (!ds4_kvstore_hash_hex_name(de->d_name, sha)) continue;
         char *path = ds4_kvstore_path_join(kc->dir, de->d_name);
         ds4_kvstore_entry e = {0};
         if (ds4_kvstore_read_entry_file(path, sha, &e)) kv_cache_push(kc, e);
@@ -518,7 +559,8 @@ static bool kv_cache_incoming_supersedes_continued(
     if (incoming->ctx_size > e->ctx_size) return false;
 
     char prefix_sha[41];
-    ds4_kvstore_sha1_bytes_hex(incoming->text, (size_t)e->text_bytes,
+    ds4_kvstore_hash_bytes_hex(ds4_kvstore_key_hash_kind(e->sha),
+                               incoming->text, (size_t)e->text_bytes,
                                prefix_sha);
     return !strcmp(prefix_sha, e->sha);
 }
@@ -960,7 +1002,8 @@ static bool kv_cache_file_text_matches(const char *path, const char sha[41],
     }
 
     char stored_sha[41];
-    ds4_kvstore_sha1_bytes_hex(stored, text_bytes, stored_sha);
+    ds4_kvstore_hash_bytes_hex(ds4_kvstore_key_hash_kind(sha),
+                               stored, text_bytes, stored_sha);
     ok = !strcmp(stored_sha, sha) &&
          (text_len == 0 || memcmp(stored, text, text_len) == 0);
     free(stored);
@@ -1123,7 +1166,7 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
         return false;
     }
     char sha[41];
-    ds4_kvstore_sha1_bytes_hex(text, text_len, sha);
+    ds4_kvstore_hash_bytes_hex(kc->opt.hash_kind, text, text_len, sha);
     char *path = ds4_kvstore_path_for_sha(kc, sha);
     const uint8_t reason_code = ds4_kvstore_reason_code(reason);
 
@@ -1333,13 +1376,19 @@ int ds4_kvstore_find_text_prefix(ds4_kvstore *kc, const char *prompt_text,
         if (e->model_id != (uint8_t)model_id) continue;
         if ((uint32_t)ctx_size < e->ctx_size) continue;
         if (kc->reject_different_quant && e->quant_bits != (uint8_t)quant_bits) continue;
+        /* Only keys written by the configured hash kind are candidates; the
+         * hex lengths differ so a cross-kind strcmp could never match anyway. */
+        if (ds4_kvstore_key_hash_kind(e->sha) !=
+            (ds4_kvstore_hash_kind)kc->opt.hash_kind)
+            continue;
         if (best >= 0) {
             ds4_kvstore_entry *b = &kc->entry[best];
             if (e->text_bytes < b->text_bytes) continue;
             if (e->text_bytes == b->text_bytes && e->tokens <= b->tokens) continue;
         }
         char sha[41];
-        ds4_kvstore_sha1_bytes_hex(prompt_text, (size_t)e->text_bytes, sha);
+        ds4_kvstore_hash_bytes_hex(kc->opt.hash_kind, prompt_text,
+                                   (size_t)e->text_bytes, sha);
         if (!strcmp(sha, e->sha)) best = i;
     }
     return best;
@@ -1397,7 +1446,8 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
             } else {
                 cached_text[text_bytes] = '\0';
                 char text_sha[41];
-                ds4_kvstore_sha1_bytes_hex(cached_text, text_bytes, text_sha);
+                ds4_kvstore_hash_bytes_hex(ds4_kvstore_key_hash_kind(e.sha),
+                                           cached_text, text_bytes, text_sha);
                 if (strcmp(text_sha, e.sha)) {
                     header_ok = false;
                     fail_reason = "cached text hash mismatch";

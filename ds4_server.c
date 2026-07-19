@@ -12705,6 +12705,17 @@ static server_config parse_options(int argc, char **argv) {
             c.kv_cache.boundary_align_tokens = parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--kv-cache-reject-different-quant")) {
             c.kv_cache_reject_different_quant = true;
+        } else if (!strcmp(arg, "--kv-cache-hash")) {
+            const char *v = need_arg(&i, argc, argv, arg);
+            if (!strcmp(v, "sha1")) {
+                c.kv_cache.hash_kind = DS4_KVSTORE_HASH_SHA1;
+            } else if (!strcmp(v, "fnv1a64")) {
+                c.kv_cache.hash_kind = DS4_KVSTORE_HASH_FNV1A64;
+            } else {
+                server_log(DS4_LOG_DEFAULT,
+                           "ds4-server: --kv-cache-hash must be sha1 or fnv1a64");
+                exit(2);
+            }
         } else if (!strcmp(arg, "--disable-exact-dsml-tool-replay")) {
             c.disable_exact_dsml_tool_replay = true;
         } else if (!strcmp(arg, "--tool-memory-max-ids")) {
@@ -16772,6 +16783,31 @@ static void test_sha1_bytes_hex_matches_known_vector(void) {
     TEST_ASSERT(!strcmp(sha, "a9993e364706816aba3e25717850c26c9cd0d89d"));
 }
 
+static void test_fnv1a64_bytes_hex_matches_known_vector(void) {
+    char key[41];
+    ds4_kvstore_fnv1a64_bytes_hex("", 0, key);
+    TEST_ASSERT(!strcmp(key, "cbf29ce484222325"));
+    ds4_kvstore_fnv1a64_bytes_hex("a", 1, key);
+    TEST_ASSERT(!strcmp(key, "af63dc4c8601ec8c"));
+    ds4_kvstore_fnv1a64_bytes_hex("foobar", 6, key);
+    TEST_ASSERT(!strcmp(key, "85944171f73967e8"));
+}
+
+static void test_kv_hash_hex_name_accepts_both_key_shapes(void) {
+    char key[41];
+    TEST_ASSERT(ds4_kvstore_hash_hex_name(
+        "a9993e364706816aba3e25717850c26c9cd0d89d.kv", key));
+    TEST_ASSERT(ds4_kvstore_key_hash_kind(key) == DS4_KVSTORE_HASH_SHA1);
+    TEST_ASSERT(ds4_kvstore_hash_hex_name("cbf29ce484222325.kv", key));
+    TEST_ASSERT(!strcmp(key, "cbf29ce484222325"));
+    TEST_ASSERT(ds4_kvstore_key_hash_kind(key) == DS4_KVSTORE_HASH_FNV1A64);
+    TEST_ASSERT(!ds4_kvstore_hash_hex_name("cbf29ce48422232.kv", key));
+    TEST_ASSERT(!ds4_kvstore_hash_hex_name("cbf29ce48422232g.kv", key));
+    TEST_ASSERT(!ds4_kvstore_hash_hex_name("cbf29ce484222325.tmp", key));
+    /* Strict sha-only validation (agent session names) still rejects fnv. */
+    TEST_ASSERT(!ds4_kvstore_sha_hex_name("cbf29ce484222325.kv", key));
+}
+
 static void test_kv_stub_file(const char *dir, const char *sha,
                               uint8_t reason, uint32_t tokens, uint32_t hits,
                               uint64_t last_used, uint64_t payload_bytes) {
@@ -16832,6 +16868,121 @@ static void test_kv_text_stub_file(const char *dir, const char *text,
                                    uint8_t reason,
                                    uint32_t tokens, uint64_t payload_bytes) {
     test_kv_text_stub_file_model(dir, text, 0, reason, tokens, payload_bytes);
+}
+
+static char *test_kv_text_stub_file_hash(const char *dir, const char *text,
+                                         int hash_kind, uint8_t model_id,
+                                         uint8_t reason, uint32_t tokens,
+                                         uint64_t payload_bytes) {
+    char key[41];
+    ds4_kvstore_hash_bytes_hex(hash_kind, text, strlen(text), key);
+    char name[44];
+    snprintf(name, sizeof(name), "%s.kv", key);
+    char *path = path_join(dir, name);
+    FILE *fp = fopen(path, "wb");
+    TEST_ASSERT(fp != NULL);
+    if (!fp) return path;
+
+    uint8_t h[KV_CACHE_FIXED_HEADER];
+    ds4_kvstore_fill_header(h, model_id, 2, reason, 0, tokens, 0,
+                            32768, 100, 100, payload_bytes);
+    uint8_t text_len[4];
+    le_put32(text_len, (uint32_t)strlen(text));
+    TEST_ASSERT(fwrite(h, 1, sizeof(h), fp) == sizeof(h));
+    TEST_ASSERT(fwrite(text_len, 1, sizeof(text_len), fp) == sizeof(text_len));
+    TEST_ASSERT(fwrite(text, 1, strlen(text), fp) == strlen(text));
+    for (uint64_t i = 0; i < payload_bytes; i++) {
+        TEST_ASSERT(fputc(0, fp) != EOF);
+    }
+    TEST_ASSERT(fclose(fp) == 0);
+    return path;
+}
+
+static void test_kv_cache_fnv_naming_lookup_integrity(void) {
+    char tmpl[] = "/tmp/ds4-kv-fnv-lookup-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+
+    const char *short_text = "fnv transcript prefix";
+    const char *long_text = "fnv transcript prefix with sampled token bytes";
+    char *short_path = test_kv_text_stub_file_hash(
+        dir, short_text, DS4_KVSTORE_HASH_FNV1A64, 0, KV_REASON_COLD, 512, 0);
+    char *long_path = test_kv_text_stub_file_hash(
+        dir, long_text, DS4_KVSTORE_HASH_FNV1A64, 0, KV_REASON_COLD, 768, 0);
+    char *wrong_model_path = test_kv_text_stub_file_hash(
+        dir, "fnv other-model prefix", DS4_KVSTORE_HASH_FNV1A64, 1,
+        KV_REASON_COLD, 512, 0);
+
+    kv_disk_cache kc = {0};
+    kc.enabled = true;
+    kc.dir = xstrdup(dir);
+    kc.opt = kv_cache_default_options();
+    kc.opt.hash_kind = DS4_KVSTORE_HASH_FNV1A64;
+
+    int idx = ds4_kvstore_find_text_prefix(&kc,
+        "fnv transcript prefix with sampled token bytes and suffix",
+        0, 2, 32768);
+    TEST_ASSERT(idx >= 0);
+    TEST_ASSERT(idx >= 0 && kc.entry[idx].tokens == 768);
+    TEST_ASSERT(idx >= 0 && kc.entry[idx].text_bytes == strlen(long_text));
+    TEST_ASSERT(idx >= 0 && strlen(kc.entry[idx].sha) == 16);
+    TEST_ASSERT(ds4_kvstore_find_text_prefix(&kc, "fnv transcript prefiX",
+                                             0, 2, 32768) < 0);
+    TEST_ASSERT(ds4_kvstore_find_text_prefix(&kc,
+        "fnv other-model prefix and tail", 0, 2, 32768) < 0);
+
+    kv_cache_close(&kc);
+    unlink(short_path);
+    unlink(long_path);
+    unlink(wrong_model_path);
+    free(short_path);
+    free(long_path);
+    free(wrong_model_path);
+    rmdir(dir);
+}
+
+static void test_kv_cache_scan_accepts_both_name_shapes(void) {
+    char tmpl[] = "/tmp/ds4-kv-mixed-names-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+
+    const char *sha_text = "sha1-keyed rendered prefix";
+    const char *fnv_text = "fnv-keyed rendered prefix";
+    char *sha_path = test_kv_text_stub_file_hash(
+        dir, sha_text, DS4_KVSTORE_HASH_SHA1, 0, KV_REASON_COLD, 512, 0);
+    char *fnv_path = test_kv_text_stub_file_hash(
+        dir, fnv_text, DS4_KVSTORE_HASH_FNV1A64, 0, KV_REASON_COLD, 512, 0);
+
+    /* Both key shapes are indexed (and therefore budget-accounted) in either
+     * configured mode; lookups only match keys of the configured kind. */
+    for (int mode = 0; mode < 2; mode++) {
+        kv_disk_cache kc = {0};
+        kc.enabled = true;
+        kc.dir = xstrdup(dir);
+        kc.opt = kv_cache_default_options();
+        kc.opt.hash_kind = mode == 0 ? DS4_KVSTORE_HASH_SHA1
+                                     : DS4_KVSTORE_HASH_FNV1A64;
+
+        int sha_idx = ds4_kvstore_find_text_prefix(&kc,
+            "sha1-keyed rendered prefix and tail", 0, 2, 32768);
+        int fnv_idx = ds4_kvstore_find_text_prefix(&kc,
+            "fnv-keyed rendered prefix and tail", 0, 2, 32768);
+        TEST_ASSERT(kc.len == 2);
+        if (mode == 0) {
+            TEST_ASSERT(sha_idx >= 0 && fnv_idx < 0);
+        } else {
+            TEST_ASSERT(sha_idx < 0 && fnv_idx >= 0);
+        }
+        kv_cache_close(&kc);
+    }
+
+    unlink(sha_path);
+    unlink(fnv_path);
+    free(sha_path);
+    free(fnv_path);
+    rmdir(dir);
 }
 
 static void test_kv_cache_lookup_uses_longest_text_prefix(void) {
@@ -17775,7 +17926,11 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_cold_store_suppresses_duplicate_continued_boundary();
     test_kv_cache_file_size_must_fit_budget();
     test_sha1_bytes_hex_matches_known_vector();
+    test_fnv1a64_bytes_hex_matches_known_vector();
+    test_kv_hash_hex_name_accepts_both_key_shapes();
     test_kv_cache_lookup_uses_longest_text_prefix();
+    test_kv_cache_fnv_naming_lookup_integrity();
+    test_kv_cache_scan_accepts_both_name_shapes();
     test_kv_cache_lookup_rejects_wrong_model();
     test_kv_cache_lookup_rejects_stale_payload_abi();
     test_kv_cache_eviction_values_fresh_snapshots();

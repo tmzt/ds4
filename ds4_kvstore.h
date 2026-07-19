@@ -33,6 +33,14 @@ typedef enum {
     DS4_KVSTORE_LOG_WARNING,
 } ds4_kvstore_log_type;
 
+/* Cache key hash for file naming and text identity.  SHA1 keys are 40 hex
+ * chars, FNV-1a keys are 16: the key length alone identifies the kind, so a
+ * directory can hold both and stay budget-accounted across mode switches. */
+typedef enum {
+    DS4_KVSTORE_HASH_SHA1    = 0,
+    DS4_KVSTORE_HASH_FNV1A64 = 1,
+} ds4_kvstore_hash_kind;
+
 typedef struct {
     /* The file name is the rendered byte prefix, not the token sequence. The
      * payload still carries the exact tokens and graph state; the hash only
@@ -62,6 +70,7 @@ typedef struct {
     int continued_interval_tokens;
     int boundary_trim_tokens;
     int boundary_align_tokens;
+    int hash_kind; /* ds4_kvstore_hash_kind; new keys only, loads accept both */
 } ds4_kvstore_options;
 
 typedef struct {
@@ -218,7 +227,13 @@ void ds4_kvstore_fill_header(uint8_t h[DS4_KVSTORE_FIXED_HEADER],
                              uint64_t payload_bytes);
 bool ds4_kvstore_touch_file(const char *path, uint32_t hits);
 bool ds4_kvstore_sha_hex_name(const char *name, char sha[41]);
+bool ds4_kvstore_hash_hex_name(const char *name, char key[41]);
 void ds4_kvstore_sha1_bytes_hex(const void *ptr, size_t len, char out[41]);
+uint64_t ds4_kvstore_fnv1a64_bytes(const void *ptr, size_t len);
+void ds4_kvstore_fnv1a64_bytes_hex(const void *ptr, size_t len, char out[41]);
+void ds4_kvstore_hash_bytes_hex(int hash_kind, const void *ptr, size_t len,
+                                char out[41]);
+ds4_kvstore_hash_kind ds4_kvstore_key_hash_kind(const char *key);
 char *ds4_kvstore_path_join(const char *dir, const char *name);
 char *ds4_kvstore_path_for_sha(ds4_kvstore *kc, const char sha[41]);
 void ds4_kvstore_le_put32(uint8_t *p, uint32_t v);
