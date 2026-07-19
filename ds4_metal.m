@@ -3505,10 +3505,18 @@ int ds4_gpu_host_memory_snapshot(ds4_ssd_host_memory *out) {
         (host_info64_t)&vm,
         &vm_count);
     (void)mach_port_deallocate(mach_task_self(), host);
+    /* A kernel older than the build SDK legitimately returns fewer words than
+     * HOST_VM_INFO64_COUNT (the struct grows over time), so require only the
+     * fields this snapshot actually reads; external_page_count is the last. */
+    const mach_msg_type_number_t vm_needed_count =
+        (mach_msg_type_number_t)((offsetof(vm_statistics64_data_t,
+                                           external_page_count) +
+                                  sizeof(vm.external_page_count)) /
+                                 sizeof(integer_t));
     if (page_kr != KERN_SUCCESS ||
         vm_kr != KERN_SUCCESS ||
         page_size == 0 ||
-        vm_count < HOST_VM_INFO64_COUNT) {
+        vm_count < vm_needed_count) {
         return 0;
     }
 
