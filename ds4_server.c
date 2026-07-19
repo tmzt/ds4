@@ -42,6 +42,7 @@
 
 static volatile sig_atomic_t g_stop_requested = 0;
 static volatile sig_atomic_t g_listen_fd = -1;
+static volatile sig_atomic_t g_infer_listen_fd = -1;
 
 #define DS4_SERVER_IO_TIMEOUT_SEC 10
 #define DS4_SERVER_SEND_STALL_TIMEOUT_MS 2000
@@ -53,6 +54,11 @@ static void stop_signal_handler(int sig) {
     if (g_listen_fd >= 0) {
         int fd = (int)g_listen_fd;
         g_listen_fd = -1;
+        close(fd);
+    }
+    if (g_infer_listen_fd >= 0) {
+        int fd = (int)g_infer_listen_fd;
+        g_infer_listen_fd = -1;
         close(fd);
     }
 }
@@ -8685,10 +8691,17 @@ struct server {
 
 /* Jobs are stack-owned by the client thread.  The worker signals completion
  * after the response has been written, so request data and the socket remain
- * valid without heap-allocating per-request job objects. */
+ * valid without heap-allocating per-request job objects.  HTTP and INFER
+ * requests share the queue so both serialize over the one live session. */
+#define JOB_KIND_HTTP 0
+#define JOB_KIND_INFER 1
+
 struct job {
     int fd;
-    request req;
+    int kind;
+    request req;                 /* JOB_KIND_HTTP */
+    ds4_infer_request infer_req; /* JOB_KIND_INFER */
+    char *infer_suffix;
     bool done;
     pthread_mutex_t mu;
     pthread_cond_t cv;
@@ -12088,6 +12101,60 @@ decode_again:
     ds4_tokens_free(&effective_prompt);
 }
 
+/* =========================================================================
+ * INFER (DS4I) jobs.
+ *
+ * ds4_infer.c owns the wire protocol and the request execution against the
+ * engine/kvstore; these callbacks wire in the two steps that touch
+ * server-private state around the shared live session.
+ * ========================================================================= */
+
+static void infer_store_live_before_evict_cb(void *ud) {
+    server *s = ud;
+    const ds4_tokens *live = ds4_session_tokens(s->session);
+    if (s->kv.enabled && live && live->len >= s->kv.opt.min_tokens)
+        kv_cache_store_current(s, "evict");
+}
+
+static void infer_session_replaced_cb(void *ud) {
+    server *s = ud;
+    responses_live_clear(s);
+    anthropic_live_clear(s);
+    thinking_live_clear(s);
+}
+
+static void infer_job(server *s, job *j) {
+    ds4_infer_ctx ctx = {
+        .engine = s->engine,
+        .session = s->session,
+        .kv = &s->kv,
+        .hooks = NULL,
+        .ud = s,
+        .store_live_before_evict = infer_store_live_before_evict_cb,
+        .session_replaced = infer_session_replaced_cb,
+    };
+    ds4_infer_result res;
+    char *text = NULL;
+    char err[256];
+    const double t0 = now_sec();
+    if (ds4_infer_job_run(&ctx, &j->infer_req, j->infer_suffix, &res, &text,
+                          err, sizeof(err)) == 0) {
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: infer prompt=%u cached=%u generated=%u stored=%u hash=%016llx %.3fs",
+                   res.prompt_tokens, res.cached_tokens, res.generated_tokens,
+                   res.stored, (unsigned long long)res.result_hash,
+                   now_sec() - t0);
+        if (ds4_infer_send_result(j->fd, &res, text) != 0)
+            server_log(DS4_LOG_WARNING,
+                       "ds4-server: infer result send failed: %s",
+                       strerror(errno));
+    } else {
+        server_log(DS4_LOG_DEFAULT, "ds4-server: infer rejected: %s", err);
+        (void)ds4_infer_send_error(j->fd, res.request_id, err);
+    }
+    free(text);
+}
+
 static bool enqueue(server *s, job *j) {
     pthread_mutex_lock(&s->mu);
     if (s->stopping) {
@@ -12121,7 +12188,8 @@ static void *worker_main(void *arg) {
     for (;;) {
         job *j = dequeue(s);
         if (!j) break;
-        generate_job(s, j);
+        if (j->kind == JOB_KIND_INFER) infer_job(s, j);
+        else generate_job(s, j);
         if (s->imatrix_path) {
             /* on-edge imatrix: periodic snapshot, on the worker thread (no lock needed:
              * this is the only thread touching the collector). prompts are NOT stored. */
@@ -12442,6 +12510,108 @@ done:
     return NULL;
 }
 
+/* One INFER connection: a persistent, sequential request loop.  The fd stays
+ * blocking — the codec's full-read/full-write discipline relies on it — and
+ * each parsed request rides the shared job queue so INFER and HTTP requests
+ * serialize over the one live session. */
+static void *infer_client_main(void *arg) {
+    client_arg *ca = arg;
+    server *s = ca->srv;
+    int fd = ca->fd;
+    free(ca);
+
+    char err[256];
+    for (;;) {
+        uint32_t type = 0, bytes = 0;
+        int rc = ds4_infer_read_frame_header(fd, &type, &bytes,
+                                             err, sizeof(err));
+        if (rc <= 0) break;
+        if (type != DS4_INFER_MSG_INFER) {
+            (void)ds4_infer_send_error(fd, 0, "unexpected frame type");
+            break;
+        }
+
+        job j;
+        memset(&j, 0, sizeof(j));
+        j.fd = fd;
+        j.kind = JOB_KIND_INFER;
+        rc = ds4_infer_recv_request(fd, bytes, &j.infer_req, &j.infer_suffix,
+                                    err, sizeof(err));
+        if (rc < 0) break;
+        if (rc == 1) {
+            /* Protocol-soft error: the frame was drained, reply and go on. */
+            if (ds4_infer_send_error(fd, j.infer_req.request_id, err) != 0)
+                break;
+            continue;
+        }
+
+        pthread_mutex_init(&j.mu, NULL);
+        pthread_cond_init(&j.cv, NULL);
+        pthread_mutex_lock(&j.mu);
+        if (!enqueue(s, &j)) {
+            pthread_mutex_unlock(&j.mu);
+            (void)ds4_infer_send_error(fd, j.infer_req.request_id,
+                                       "server shutting down");
+            pthread_cond_destroy(&j.cv);
+            pthread_mutex_destroy(&j.mu);
+            free(j.infer_suffix);
+            break;
+        }
+        while (!j.done) pthread_cond_wait(&j.cv, &j.mu);
+        pthread_mutex_unlock(&j.mu);
+        pthread_cond_destroy(&j.cv);
+        pthread_mutex_destroy(&j.mu);
+        free(j.infer_suffix);
+    }
+    close(fd);
+    client_done(s);
+    return NULL;
+}
+
+typedef struct {
+    server *srv;
+    int lfd;
+    bool is_unix;
+} infer_accept_arg;
+
+static void *infer_accept_main(void *arg) {
+    infer_accept_arg *aa = arg;
+    server *s = aa->srv;
+    while (!g_stop_requested) {
+        int fd = accept(aa->lfd, NULL, NULL);
+        if (fd < 0) {
+            if (g_stop_requested) break;
+            if (errno == EINTR) continue;
+            server_log(DS4_LOG_DEFAULT, "ds4-server: infer accept failed: %s",
+                       strerror(errno));
+            continue;
+        }
+        if (g_stop_requested) {
+            close(fd);
+            break;
+        }
+        ds4_infer_socket_prepare(fd, aa->is_unix);
+        client_arg *ca = xmalloc(sizeof(*ca));
+        ca->srv = s;
+        ca->fd = fd;
+        pthread_mutex_lock(&s->mu);
+        s->clients++;
+        pthread_mutex_unlock(&s->mu);
+        pthread_t th;
+        if (pthread_create(&th, NULL, infer_client_main, ca) != 0) {
+            pthread_mutex_lock(&s->mu);
+            s->clients--;
+            pthread_cond_broadcast(&s->clients_cv);
+            pthread_mutex_unlock(&s->mu);
+            free(ca);
+            close(fd);
+            continue;
+        }
+        pthread_detach(th);
+    }
+    return NULL;
+}
+
 static int listen_on(const char *host, int port) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) return -1;
@@ -12503,6 +12673,7 @@ typedef struct {
     bool disable_exact_dsml_tool_replay;
     int tool_memory_max_ids;
     bool enable_cors;
+    const char *infer_listen; /* NULL = DS4I INFER endpoint disabled */
 } server_config;
 
 static int parse_int_arg(const char *s, const char *opt) {
@@ -12717,6 +12888,8 @@ static server_config parse_options(int argc, char **argv) {
                            "ds4-server: --kv-cache-hash must be sha1 or fnv1a64");
                 exit(2);
             }
+        } else if (!strcmp(arg, "--listen-infer")) {
+            c.infer_listen = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--disable-exact-dsml-tool-replay")) {
             c.disable_exact_dsml_tool_replay = true;
         } else if (!strcmp(arg, "--tool-memory-max-ids")) {
@@ -12806,6 +12979,20 @@ static server_config parse_options(int argc, char **argv) {
                    "ds4-server: --kv-cache-cold-max-tokens must be 0 or >= --kv-cache-min-tokens");
         exit(2);
     }
+    if (c.infer_listen) {
+        /* The INFER prefix hash is a direct fnv-named checkpoint lookup, so
+         * the disk cache must exist and use the matching key kind. */
+        if (!c.kv_disk_dir) {
+            server_log(DS4_LOG_DEFAULT,
+                       "ds4-server: --listen-infer requires --kv-disk-dir");
+            exit(2);
+        }
+        if (c.kv_cache.hash_kind != DS4_KVSTORE_HASH_FNV1A64) {
+            server_log(DS4_LOG_DEFAULT,
+                       "ds4-server: --listen-infer requires --kv-cache-hash fnv1a64");
+            exit(2);
+        }
+    }
     if (c.engine.directional_steering_file && !directional_steering_scale_set) {
         c.engine.directional_steering_ffn = 1.0f;
     }
@@ -12856,6 +13043,13 @@ int main(int argc, char **argv) {
         int rc = ds4_dist_run(engine, &cfg.engine.distributed, &gen);
         ds4_engine_close(engine);
         return rc;
+    }
+    if (cfg.infer_listen &&
+        ds4_engine_chat_format(engine) == DS4_CHAT_FORMAT_QWEN36) {
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: --listen-infer is not supported for the Qwen chat format (disk KV text keys are disabled)");
+        ds4_engine_close(engine);
+        return 1;
     }
 
     ds4_session *session = NULL;
@@ -12930,6 +13124,41 @@ int main(int argc, char **argv) {
     g_listen_fd = lfd;
     server_log(DS4_LOG_DEFAULT, "ds4-server: listening on http://%s:%d", cfg.host, cfg.port);
 
+    int infer_lfd = -1;
+    infer_accept_arg infer_arg = {0};
+    pthread_t infer_acceptor;
+    bool infer_acceptor_started = false;
+    if (cfg.infer_listen) {
+        char ierr[256] = {0};
+        infer_lfd = ds4_infer_listen_endpoint(cfg.infer_listen,
+                                              ierr, sizeof(ierr));
+        if (infer_lfd < 0) {
+            server_log(DS4_LOG_DEFAULT,
+                       "ds4-server: failed to listen for INFER on %s: %s",
+                       cfg.infer_listen, ierr);
+            close(lfd);
+            g_listen_fd = -1;
+            pthread_mutex_lock(&s.mu);
+            s.stopping = true;
+            pthread_cond_broadcast(&s.cv);
+            pthread_mutex_unlock(&s.mu);
+            pthread_join(worker, NULL);
+            server_close_resources(&s);
+            return 1;
+        }
+        g_infer_listen_fd = infer_lfd;
+        infer_arg.srv = &s;
+        infer_arg.lfd = infer_lfd;
+        infer_arg.is_unix = ds4_infer_endpoint_is_unix(cfg.infer_listen);
+        if (pthread_create(&infer_acceptor, NULL, infer_accept_main,
+                           &infer_arg) != 0)
+            die("failed to start infer acceptor");
+        infer_acceptor_started = true;
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: listening for INFER (DS4I) on %s",
+                   cfg.infer_listen);
+    }
+
     while (!g_stop_requested) {
         int fd = accept(lfd, NULL, NULL);
         if (fd < 0) {
@@ -12966,6 +13195,13 @@ int main(int argc, char **argv) {
         close(lfd);
         g_listen_fd = -1;
     }
+    if (g_infer_listen_fd >= 0) {
+        close(infer_lfd);
+        g_infer_listen_fd = -1;
+    }
+    if (infer_acceptor_started) pthread_join(infer_acceptor, NULL);
+    if (cfg.infer_listen && ds4_infer_endpoint_is_unix(cfg.infer_listen))
+        unlink(cfg.infer_listen + 5);
 
     server_log(DS4_LOG_DEFAULT, "ds4-server: shutdown requested, draining requests");
     pthread_mutex_lock(&s.mu);
