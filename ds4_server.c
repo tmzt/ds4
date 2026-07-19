@@ -13044,13 +13044,6 @@ int main(int argc, char **argv) {
         ds4_engine_close(engine);
         return rc;
     }
-    if (cfg.infer_listen &&
-        ds4_engine_chat_format(engine) == DS4_CHAT_FORMAT_QWEN36) {
-        server_log(DS4_LOG_DEFAULT,
-                   "ds4-server: --listen-infer is not supported for the Qwen chat format (disk KV text keys are disabled)");
-        ds4_engine_close(engine);
-        return 1;
-    }
 
     ds4_session *session = NULL;
     if (ds4_session_create(&session, engine, cfg.ctx_size) != 0) {

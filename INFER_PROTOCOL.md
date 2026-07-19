@@ -32,8 +32,19 @@ Server requirements:
 ```
 
 `--kv-cache-hash fnv1a64` is mandatory: prefix resolution is a direct lookup
-of the checkpoint file named by the hash.  The Qwen chat format is not
-supported (its disk KV text keys are disabled engine-wide).
+of the checkpoint file named by the hash.
+
+Qwen models are supported, with one deliberate asymmetry.  The chat/HTTP
+paths keep their disk KV cache disabled for Qwen because they mix two
+provenance classes — template-authored control tokens versus client data that
+may spell the same bytes — which a byte-only cache key cannot represent.
+INFER has exactly one provenance class: the client renders the whole prompt,
+so control-token spellings in the suffix (for example `<|im_start|>`) are
+parsed as real control tokens, by contract.  Qwen INFER checkpoints are
+marked with a rendered-text provenance flag and are only ever loadable by
+exact INFER key; the HTTP paths never see them.  Prompt-injection hygiene for
+Qwen transcripts is therefore entirely the client's responsibility — exactly
+as it is for the rest of this raw protocol.
 
 ## Framing
 

@@ -217,7 +217,10 @@ Disk KV cache bugs are high impact for server users.
 ## 9b. Remote INFER (DS4I)
 
 Run after any change to `ds4_infer.c`, the kvstore key/hashing paths, or the
-server job queue.  Needs a real model; see `INFER_PROTOCOL.md`.
+server job queue.  Needs a real model; see `INFER_PROTOCOL.md`.  Qwen
+artifacts can run this recipe (INFER text is single-provenance by contract);
+their chat/HTTP disk KV caching remains disabled by design, so also confirm
+an HTTP Qwen request neither hits nor writes the INFER-created entries.
 
 - Start the server with the INFER endpoint on a Unix socket:
   `./ds4-server -m <model> --kv-disk-dir /tmp/ds4-kv \

@@ -583,7 +583,7 @@ int ds4_infer_job_run(ds4_infer_ctx *ctx, const ds4_infer_request *req,
             return infer_fail(res, err, errlen, "unknown prefix hash");
         }
         res->cached_tokens = (uint32_t)rc;
-        if (!ds4_kvstore_build_prompt_from_exact_prefix_and_text_suffix(
+        if (!ds4_kvstore_build_prompt_from_exact_prefix_and_rendered_suffix(
                 ctx->engine, ds4_session_tokens(ctx->session), suffix,
                 &prompt)) {
             free(prefix_text);

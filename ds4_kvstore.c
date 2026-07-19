@@ -783,22 +783,11 @@ static bool kv_append_utf8_split_suffix(
     return true;
 }
 
-bool ds4_kvstore_build_prompt_from_exact_prefix_and_text_suffix(
+static bool kv_build_prompt_exact_prefix_rendered_suffix(
         ds4_engine *engine,
         const ds4_tokens *exact_prefix,
         const char *suffix_text,
         ds4_tokens *out) {
-    if (!engine || !exact_prefix || !out) return false;
-
-    /* Qwen's structured renderer deliberately distinguishes template-authored
-     * control tokens from identical bytes supplied by a client.  A plain text
-     * suffix has lost that provenance, so retokenizing it as rendered chat can
-     * promote client text such as <|im_end|> into a control token.  Exact token
-     * prefix reuse is handled before this byte-prefix fallback in the server;
-     * reject every Qwen text reconstruction until cache entries carry trusted
-     * renderer segments (or the full canonical token stream) explicitly. */
-    if (ds4_engine_chat_format(engine) == DS4_CHAT_FORMAT_QWEN36) return false;
-
     /* Build off to the side: callers often pass a reusable effective-prompt
      * buffer, and a failed suffix tokenization must not leave it containing a
      * valid-looking exact prefix followed by a partial/stale suffix. */
@@ -822,6 +811,38 @@ bool ds4_kvstore_build_prompt_from_exact_prefix_and_text_suffix(
     *out = built;
     ds4_tokens_free(&old);
     return true;
+}
+
+bool ds4_kvstore_build_prompt_from_exact_prefix_and_text_suffix(
+        ds4_engine *engine,
+        const ds4_tokens *exact_prefix,
+        const char *suffix_text,
+        ds4_tokens *out) {
+    if (!engine || !exact_prefix || !out) return false;
+
+    /* Qwen's structured renderer deliberately distinguishes template-authored
+     * control tokens from identical bytes supplied by a client.  A plain text
+     * suffix has lost that provenance, so retokenizing it as rendered chat can
+     * promote client text such as <|im_end|> into a control token.  Exact token
+     * prefix reuse is handled before this byte-prefix fallback in the server;
+     * reject every Qwen text reconstruction on the chat paths.  The rendered
+     * variant below is for protocols with a single provenance class. */
+    if (ds4_engine_chat_format(engine) == DS4_CHAT_FORMAT_QWEN36) return false;
+    return kv_build_prompt_exact_prefix_rendered_suffix(engine, exact_prefix,
+                                                        suffix_text, out);
+}
+
+/* INFER variant: the whole transcript is client-rendered text, so there is
+ * only one provenance class and control-token spellings in the suffix are
+ * intended as control tokens.  Safe for Qwen by construction. */
+bool ds4_kvstore_build_prompt_from_exact_prefix_and_rendered_suffix(
+        ds4_engine *engine,
+        const ds4_tokens *exact_prefix,
+        const char *suffix_text,
+        ds4_tokens *out) {
+    if (!engine || !exact_prefix || !out) return false;
+    return kv_build_prompt_exact_prefix_rendered_suffix(engine, exact_prefix,
+                                                        suffix_text, out);
 }
 
 bool ds4_kvstore_build_prompt_from_exact_prefix_and_canonical_suffix(
@@ -1107,8 +1128,13 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
      * represent: client text may spell the same bytes as template-authored
      * <|im_start|>/<|im_end|> tokens.  Loads are disabled for the same reason
      * below; do not create unusable entries (or spend SSD writes) until the
-     * on-disk format records the exact canonical token prefix. */
-    if (ds4_engine_chat_format(engine) == DS4_CHAT_FORMAT_QWEN36) return false;
+     * on-disk format records the exact canonical token prefix.  INFER-keyed
+     * text (DS4_KVSTORE_EXT_INFER_TEXT) is exempt: the whole transcript is
+     * client-rendered, so there is only one provenance class, and such
+     * entries are only ever consumed by exact-key INFER loads. */
+    if (ds4_engine_chat_format(engine) == DS4_CHAT_FORMAT_QWEN36 &&
+        !(cache_text_ext & DS4_KVSTORE_EXT_INFER_TEXT))
+        return false;
     if (!tokens || store_len < kc->opt.min_tokens) return false;
     const int original_len = tokens->len;
 
@@ -1578,8 +1604,10 @@ int ds4_kvstore_try_load_by_key(ds4_kvstore *kc,
     if (cache_text_len_out) *cache_text_len_out = 0;
     if (err && err_len) err[0] = '\0';
     if (!kc->enabled || !key || !key[0]) return 0;
-    /* Same Qwen provenance restriction as the text-prefix paths above. */
-    if (ds4_engine_chat_format(engine) == DS4_CHAT_FORMAT_QWEN36) return 0;
+    /* Qwen entries are only sound when the stored text is single-provenance
+     * client-rendered INFER text; the flag is checked after the header read. */
+    const bool qwen_requires_infer_text =
+        ds4_engine_chat_format(engine) == DS4_CHAT_FORMAT_QWEN36;
     const int quant_bits = ds4_engine_routed_quant_bits(engine);
     if (quant_bits != 2 && quant_bits != 4) return 0;
     const int model_id = ds4_engine_model_id(engine);
@@ -1618,6 +1646,11 @@ int ds4_kvstore_try_load_by_key(ds4_kvstore *kc,
             header_ok = false;
             compatible = false;
             fail_reason = "cached checkpoint needs a larger context";
+        } else if (qwen_requires_infer_text &&
+                   !(hdr.ext_flags & DS4_KVSTORE_EXT_INFER_TEXT)) {
+            header_ok = false;
+            compatible = false;
+            fail_reason = "qwen checkpoint lacks rendered-text provenance";
         } else {
             cached_text = kv_xmalloc((size_t)text_bytes + 1);
             if (fread(cached_text, 1, text_bytes, fp) != text_bytes) {

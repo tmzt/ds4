@@ -141,6 +141,14 @@ bool ds4_kvstore_build_prompt_from_exact_prefix_and_text_suffix(
         const ds4_tokens *exact_prefix,
         const char *suffix_text,
         ds4_tokens *out);
+/* Same, but the suffix is declared single-provenance client-rendered text
+ * (the INFER protocol), so the Qwen chat-path provenance gate does not
+ * apply: control-token spellings are intended as control tokens. */
+bool ds4_kvstore_build_prompt_from_exact_prefix_and_rendered_suffix(
+        ds4_engine *engine,
+        const ds4_tokens *exact_prefix,
+        const char *suffix_text,
+        ds4_tokens *out);
 /* Keep an exact live checkpoint and append a suffix from an already-tokenized
  * canonical prompt. text_prefix_bytes must land exactly on a token boundary. */
 bool ds4_kvstore_build_prompt_from_exact_prefix_and_canonical_suffix(
