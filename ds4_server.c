@@ -12673,7 +12673,8 @@ typedef struct {
     bool disable_exact_dsml_tool_replay;
     int tool_memory_max_ids;
     bool enable_cors;
-    const char *infer_listen; /* NULL = DS4I INFER endpoint disabled */
+    bool infer_listen_set;    /* --listen-infer given (endpoint may be defaulted) */
+    const char *infer_listen; /* NULL with infer_listen_set = use the default */
 } server_config;
 
 static int parse_int_arg(const char *s, const char *opt) {
@@ -12889,7 +12890,12 @@ static server_config parse_options(int argc, char **argv) {
                 exit(2);
             }
         } else if (!strcmp(arg, "--listen-infer")) {
-            c.infer_listen = need_arg(&i, argc, argv, arg);
+            /* The endpoint is optional: a bare --listen-infer serves the
+             * default unix:$HOME/.ds4/infer.sock.  Endpoint specs never start
+             * with '-', so peeking cannot swallow a following option. */
+            c.infer_listen_set = true;
+            if (i + 1 < argc && argv[i + 1][0] != '-')
+                c.infer_listen = argv[++i];
         } else if (!strcmp(arg, "--disable-exact-dsml-tool-replay")) {
             c.disable_exact_dsml_tool_replay = true;
         } else if (!strcmp(arg, "--tool-memory-max-ids")) {
@@ -12979,7 +12985,7 @@ static server_config parse_options(int argc, char **argv) {
                    "ds4-server: --kv-cache-cold-max-tokens must be 0 or >= --kv-cache-min-tokens");
         exit(2);
     }
-    if (c.infer_listen) {
+    if (c.infer_listen_set) {
         /* The INFER prefix hash is a direct fnv-named checkpoint lookup, so
          * the disk cache must exist and use the matching key kind. */
         if (!c.kv_disk_dir) {
@@ -13023,6 +13029,17 @@ int main(int argc, char **argv) {
     sigaction(SIGTERM, &sa, NULL);
 
     server_config cfg = parse_options(argc, argv);
+    char infer_default_spec[PATH_MAX];
+    if (cfg.infer_listen_set && !cfg.infer_listen) {
+        const char *home = getenv("HOME");
+        if (!home || !home[0]) home = ".";
+        char ds4_dir[PATH_MAX];
+        snprintf(ds4_dir, sizeof(ds4_dir), "%s/.ds4", home);
+        (void)mkdir(ds4_dir, 0700); /* EEXIST is fine */
+        snprintf(infer_default_spec, sizeof(infer_default_spec),
+                 "unix:%s/infer.sock", ds4_dir);
+        cfg.infer_listen = infer_default_spec;
+    }
     if (cfg.chdir_path && chdir(cfg.chdir_path) != 0) {
         server_log(DS4_LOG_DEFAULT, "ds4-server: failed to chdir to %s: %s",
                    cfg.chdir_path, strerror(errno));

@@ -319,7 +319,7 @@ static void print_server_api(FILE *fp, const help_colors *c) {
     para(fp, c, "Model endpoint aliases include deepseek-v4-flash and deepseek-v4-pro; both serve the loaded GGUF.");
     fputc('\n', fp);
     title(fp, c, "Remote INFER (DS4I)");
-    opt(fp, c, "--listen-infer EP", "Serve the raw-completion INFER protocol on host:port or unix:/path.");
+    opt(fp, c, "--listen-infer [EP]", "Serve the raw-completion INFER protocol on host:port or unix:/path. Default EP: unix:~/.ds4/infer.sock");
     para(fp, c, "Requires --kv-disk-dir and --kv-cache-hash fnv1a64; clients address cached prefixes by text hash.");
     para(fp, c, "No authentication: trusted networks or unix sockets only. See INFER_PROTOCOL.md.");
     fputc('\n', fp);

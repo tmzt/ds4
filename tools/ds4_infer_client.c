@@ -6,7 +6,7 @@
  * protocol or documentation bug surfacing in tests rather than in the field.
  *
  * Usage:
- *   ds4-infer-client --connect {host:port|unix:/path}
+ *   ds4-infer-client [--connect {host:port|unix:/path}]
  *                    [--prefix-file F | --prefix-hash HEX16]
  *                    [--suffix TEXT | --suffix-file F]
  *                    [--cache-only] [--n-predict N] [--temp F] [--top-p F]
@@ -188,12 +188,15 @@ static int connect_endpoint(const char *spec) {
 }
 
 static void usage(FILE *fp) {
-    fputs("Usage: ds4-infer-client --connect {host:port|unix:/path}\n"
+    fputs("Usage: ds4-infer-client [--connect {host:port|unix:/path}]\n"
           "         [--prefix-file F | --prefix-hash HEX16]\n"
           "         [--suffix TEXT | --suffix-file F]\n"
           "         [--cache-only] [--n-predict N] [--temp F] [--top-p F]\n"
           "         [--min-p F] [--top-k N] [--seed N]\n"
-          "       ds4-infer-client --print-hash [FILE]\n",
+          "       ds4-infer-client --print-hash [FILE]\n"
+          "\n"
+          "--connect defaults to unix:$HOME/.ds4/infer.sock, matching the\n"
+          "server's bare --listen-infer default.\n",
           fp);
 }
 
@@ -271,9 +274,16 @@ int main(int argc, char **argv) {
         }
     }
 
+    char default_spec[1024];
     if (!connect_spec) {
-        usage(stderr);
-        return 1;
+        const char *home = getenv("HOME");
+        if (!home || !home[0]) {
+            usage(stderr);
+            return 1;
+        }
+        snprintf(default_spec, sizeof(default_spec),
+                 "unix:%s/.ds4/infer.sock", home);
+        connect_spec = default_spec;
     }
     if (prefix_file && have_prefix_hash) {
         fprintf(stderr,

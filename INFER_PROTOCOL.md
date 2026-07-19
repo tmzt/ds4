@@ -28,8 +28,13 @@ Server requirements:
 ./ds4-server -m model.gguf \
   --kv-disk-dir ~/.ds4/server-kv \
   --kv-cache-hash fnv1a64 \
-  --listen-infer unix:/tmp/ds4-infer.sock   # or --listen-infer 127.0.0.1:8100
+  --listen-infer   # defaults to unix:$HOME/.ds4/infer.sock; or give
+                   # --listen-infer unix:/path or --listen-infer host:port
 ```
+
+A bare `--listen-infer` serves `unix:$HOME/.ds4/infer.sock` (creating
+`~/.ds4` if needed), and `ds4-infer-client` connects there when `--connect`
+is omitted, so the local zero-config pairing just works.
 
 `--kv-cache-hash fnv1a64` is mandatory: prefix resolution is a direct lookup
 of the checkpoint file named by the hash.
