@@ -26,6 +26,13 @@
 </p>
 
 > [!IMPORTANT]
+> This is `tmzt/ds4` a fork of a fork which adds a new INFER protocol based on the
+> distributed protocol. It enables explicit support for caching a conversation or
+> system prompt prefix and returns a hash of the combined prompt which can be tracked.
+> 
+> This is documented in [INFER](./INFER_PROTOCOL.md).
+
+> [!IMPORTANT]
 > This is [`andreaborio/ds4`](https://github.com/andreaborio/ds4), a fork of
 > [`antirez/ds4`](https://github.com/antirez/ds4). It does **not** aim to replace
 > upstream. The goal is to co-develop DwarfStar: explore complementary hardware
