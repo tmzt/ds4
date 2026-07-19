@@ -1557,6 +1557,135 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
     return loaded;
 }
 
+/* Load a checkpoint addressed by its exact cache key (filename hash), for
+ * protocols where the client names the prefix instead of resending its bytes.
+ * Unlike ds4_kvstore_try_load_text there is no prompt to prefix-match, no
+ * effective-prompt rebuild, and no consume-on-load: a key the client addressed
+ * explicitly must stay resolvable for its next request, so the entry is only
+ * hit-touched.  Returns loaded tokens, 0 for miss/incompatible entries, -1
+ * when a matching entry exists but restoring it failed.  On success the
+ * stored cache text is returned as a malloc'd NUL-terminated copy. */
+int ds4_kvstore_try_load_by_key(ds4_kvstore *kc,
+                                ds4_engine *engine,
+                                ds4_session *session,
+                                const char key[41],
+                                char **cache_text_out,
+                                size_t *cache_text_len_out,
+                                const ds4_kvstore_trailer_hooks *hooks,
+                                char *err,
+                                size_t err_len) {
+    if (cache_text_out) *cache_text_out = NULL;
+    if (cache_text_len_out) *cache_text_len_out = 0;
+    if (err && err_len) err[0] = '\0';
+    if (!kc->enabled || !key || !key[0]) return 0;
+    /* Same Qwen provenance restriction as the text-prefix paths above. */
+    if (ds4_engine_chat_format(engine) == DS4_CHAT_FORMAT_QWEN36) return 0;
+    const int quant_bits = ds4_engine_routed_quant_bits(engine);
+    if (quant_bits != 2 && quant_bits != 4) return 0;
+    const int model_id = ds4_engine_model_id(engine);
+
+    char *path = ds4_kvstore_path_for_sha(kc, key);
+    ds4_kvstore_entry e = {0};
+    if (!ds4_kvstore_read_entry_file(path, key, &e)) {
+        free(path);
+        return 0;
+    }
+    ds4_kvstore_entry_free(&e);
+
+    const double load_t0 = kv_now_sec();
+    FILE *fp = fopen(path, "rb");
+    if (!fp) {
+        free(path);
+        return 0;
+    }
+    uint32_t text_bytes = 0;
+    ds4_kvstore_entry hdr = {0};
+    const char *fail_reason = "invalid header";
+    bool header_ok = ds4_kvstore_read_header(fp, &hdr, &text_bytes);
+    bool compatible = true;
+    char *cached_text = NULL;
+    if (header_ok) {
+        if (hdr.model_id != (uint8_t)model_id) {
+            header_ok = false;
+            compatible = false;
+            fail_reason = "cached checkpoint was written for a different model";
+        } else if (kc->reject_different_quant &&
+                   hdr.quant_bits != (uint8_t)quant_bits) {
+            header_ok = false;
+            compatible = false;
+            fail_reason = "cached checkpoint quantization differs";
+        } else if (hdr.ctx_size > (uint32_t)ds4_session_ctx(session)) {
+            header_ok = false;
+            compatible = false;
+            fail_reason = "cached checkpoint needs a larger context";
+        } else {
+            cached_text = kv_xmalloc((size_t)text_bytes + 1);
+            if (fread(cached_text, 1, text_bytes, fp) != text_bytes) {
+                header_ok = false;
+                fail_reason = "truncated cached text";
+            } else {
+                cached_text[text_bytes] = '\0';
+                char text_hash[41];
+                ds4_kvstore_hash_bytes_hex(ds4_kvstore_key_hash_kind(key),
+                                           cached_text, text_bytes, text_hash);
+                if (strcmp(text_hash, key)) {
+                    header_ok = false;
+                    fail_reason = "cached text hash mismatch";
+                }
+            }
+        }
+    }
+    char load_err[160] = {0};
+    int loaded = 0;
+    if (header_ok &&
+        ds4_session_load_payload(session, fp, hdr.payload_bytes,
+                                 load_err, sizeof(load_err)) == 0)
+    {
+        const ds4_tokens *loaded_tokens = ds4_session_tokens(session);
+        if (loaded_tokens && loaded_tokens->len == (int)hdr.tokens) {
+            loaded = (int)hdr.tokens;
+            if (hooks && hooks->load && (hdr.ext_flags & hooks->ext_flag)) {
+                hooks->load(hooks->ud, fp, hooks->load_wanted);
+            }
+        } else {
+            ds4_session_invalidate(session);
+            unlink(path);
+            fail_reason = "corrupt checkpoint payload";
+            kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
+                    "%s: kv cache discarded corrupt by-key payload %s",
+                    kv_log_name(kc), path);
+        }
+    } else if (header_ok) {
+        ds4_session_invalidate(session);
+        fail_reason = load_err[0] ? load_err : "payload load failed";
+    }
+    fclose(fp);
+
+    if (loaded > 0) {
+        const double load_ms = (kv_now_sec() - load_t0) * 1000.0;
+        kc->continued_last_store_tokens = loaded;
+        ds4_kvstore_touch_file(path, hdr.hits + 1);
+        kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
+                "%s: kv cache hit key=%s tokens=%d text=%u quant=%u load=%.1f ms file=%s",
+                kv_log_name(kc), key, loaded, text_bytes, hdr.quant_bits,
+                load_ms, path);
+        if (cache_text_out) {
+            *cache_text_out = cached_text;
+            cached_text = NULL;
+        }
+        if (cache_text_len_out) *cache_text_len_out = (size_t)text_bytes;
+    } else {
+        kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
+                "%s: kv cache by-key load failed key=%s: %s",
+                kv_log_name(kc), key, fail_reason);
+        if (err && err_len) snprintf(err, err_len, "%s", fail_reason);
+    }
+    free(cached_text);
+    free(path);
+    if (loaded > 0) return loaded;
+    return compatible ? -1 : 0;
+}
+
 void ds4_kvstore_load_result_free(ds4_kvstore_load_result *result) {
     if (!result) return;
     free(result->path);

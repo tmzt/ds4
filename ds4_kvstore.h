@@ -213,6 +213,19 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
                               ds4_kvstore_load_result *result,
                               const ds4_kvstore_trailer_hooks *hooks,
                               bool responses_protocol);
+/* Load a checkpoint by its exact cache key.  Returns loaded tokens, 0 for
+ * miss/incompatible, -1 when the entry exists but restoring failed.  Never
+ * consumes the entry; on success *cache_text_out is a malloc'd copy of the
+ * stored text. */
+int ds4_kvstore_try_load_by_key(ds4_kvstore *kc,
+                                ds4_engine *engine,
+                                ds4_session *session,
+                                const char key[41],
+                                char **cache_text_out,
+                                size_t *cache_text_len_out,
+                                const ds4_kvstore_trailer_hooks *hooks,
+                                char *err,
+                                size_t err_len);
 void ds4_kvstore_load_result_free(ds4_kvstore_load_result *result);
 
 bool ds4_kvstore_read_header(FILE *fp, ds4_kvstore_entry *e,
