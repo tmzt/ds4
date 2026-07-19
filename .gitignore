@@ -4,6 +4,7 @@
 /ds4-eval
 /ds4-agent
 /ds4-qwen-pack
+/ds4-infer-client
 /ds4_native
 /ds4_server_test
 /ds4_test

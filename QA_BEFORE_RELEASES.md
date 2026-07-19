@@ -209,6 +209,36 @@ Disk KV cache bugs are high impact for server users.
   or raw/compressed KV layout changes.
 - Test stripped agent sessions: `/strip <id>` then `/switch <id>` should rebuild
   by prefill and render sane history.
+- After any cache-key or hashing change, run both key modes: repeat the
+  hit/eviction checks with `--kv-cache-hash fnv1a64` and confirm a directory
+  holding both 40-hex and 16-hex `.kv` files stays budget-accounted in either
+  mode (`./ds4_test --server` covers the model-free part).
+
+## 9b. Remote INFER (DS4I)
+
+Run after any change to `ds4_infer.c`, the kvstore key/hashing paths, or the
+server job queue.  Needs a real model; see `INFER_PROTOCOL.md`.
+
+- Start the server with the INFER endpoint on a Unix socket:
+  `./ds4-server -m <model> --kv-disk-dir /tmp/ds4-kv \
+   --kv-cache-hash fnv1a64 --listen-infer unix:/tmp/ds4-infer.sock`.
+- Pre-cache a system prompt (>= `--kv-cache-min-tokens` tokens) and record the
+  hash: `./ds4-infer-client --connect unix:/tmp/ds4-infer.sock \
+   --suffix-file sysprompt.txt --cache-only` must report `stored=1`.
+- Run a generation addressing that hash:
+  `./ds4-infer-client --connect unix:/tmp/ds4-infer.sock \
+   --prefix-hash <hash> --suffix "User question..." --n-predict 128`
+  must report `cached>0` and sane text.
+- Chain a second turn with the returned `result_hash` as `--prefix-hash` and
+  verify it also reports `cached>0` (hash chaining survives the round trip).
+- Verify `--prefix-hash 0123456789abcdef` (bogus) fails with
+  `unknown prefix hash`, and that the same request works after re-caching.
+- Repeat the pre-cache + one generation over TCP (`--listen-infer
+  127.0.0.1:8100`).
+- Restart the server and confirm the pre-cached hash still resolves
+  (disk-backed prefixes survive restarts).
+- Confirm concurrent HTTP requests still work while an INFER connection is
+  open, and that Ctrl+C shutdown removes the Unix socket file.
 
 ## 10. Server APIs
 

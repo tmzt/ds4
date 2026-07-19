@@ -31,7 +31,7 @@ PROGRAMS := ds4 ds4-server ds4-bench ds4-eval ds4-agent
 	strix-halo rocm metal build-isolation-test q4k-dot-test qwen-metadata-test \
 	qwen-reference-test qwen-unicode-test qwen-tokenizer-test \
 	qwen-expert-group-test qwen-expert-pack-test expert-store-test ds4-qwen-pack \
-	$(PROGRAMS) ds4_test ds4_agent_test
+	ds4-infer-client $(PROGRAMS) ds4_test ds4_agent_test
 
 ifeq ($(UNAME_S),Darwin)
 
@@ -359,6 +359,12 @@ $(METAL_BINDIR)/ds4-qwen-pack: \
 	@mkdir -p "$(@D)"
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
+# Standalone on purpose: an independent implementation of INFER_PROTOCOL.md,
+# like the out-of-tree clients it exists to validate.
+$(METAL_BINDIR)/ds4-infer-client: tools/ds4_infer_client.c
+	@mkdir -p "$(@D)"
+	$(CC) $(CFLAGS) -o $@ tools/ds4_infer_client.c
+
 $(METAL_BINDIR)/test_qwen_expert_pack: \
 		$(METAL_OBJDIR)/test_qwen_expert_pack.o \
 		$(METAL_OBJDIR)/ds4_qwen_expert_pack.o \
@@ -379,6 +385,10 @@ $(METAL_BINDIR)/test_expert_store: \
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
 ds4-qwen-pack: $(METAL_BINDIR)/ds4-qwen-pack
+	@rm -f "$@"
+	@ln -s "$<" "$@"
+
+ds4-infer-client: $(METAL_BINDIR)/ds4-infer-client
 	@rm -f "$@"
 	@ln -s "$<" "$@"
 
