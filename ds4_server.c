@@ -1,6 +1,7 @@
 #include "ds4.h"
 #include "ds4_distributed.h"
 #include "ds4_help.h"
+#include "ds4_infer.h"
 #include "ds4_kvstore.h"
 #include "rax.h"
 
@@ -16985,6 +16986,261 @@ static void test_kv_cache_scan_accepts_both_name_shapes(void) {
     rmdir(dir);
 }
 
+static ds4_infer_request test_infer_sample_request(void) {
+    ds4_infer_request r = {0};
+    r.version = DS4_INFER_VERSION;
+    r.request_id = 0x0000000100000002ull;
+    r.flags = 0;
+    r.prefix_hash = DS4_INFER_EMPTY_PREFIX_HASH;
+    r.suffix_bytes = 6;
+    r.n_predict = 16;
+    r.temperature = 0.7f;
+    r.top_k = 40;
+    r.top_p = 0.95f;
+    r.min_p = 0.05f;
+    r.seed = 0x123456789abcdef0ull;
+    return r;
+}
+
+static void test_infer_be32(uint8_t *p, uint32_t v) {
+    p[0] = (uint8_t)(v >> 24);
+    p[1] = (uint8_t)(v >> 16);
+    p[2] = (uint8_t)(v >> 8);
+    p[3] = (uint8_t)v;
+}
+
+static void test_infer_frame_roundtrip(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+
+    const char *suffix = "hello\n";
+    ds4_infer_request in = test_infer_sample_request();
+    TEST_ASSERT(ds4_infer_send_request(sv[0], &in, suffix) == 0);
+
+    uint32_t type = 0, bytes = 0;
+    char err[160];
+    TEST_ASSERT(ds4_infer_read_frame_header(sv[1], &type, &bytes,
+                                            err, sizeof(err)) == 1);
+    TEST_ASSERT(type == DS4_INFER_MSG_INFER);
+    TEST_ASSERT(bytes == 56u + 6u);
+
+    ds4_infer_request out;
+    char *got_suffix = NULL;
+    TEST_ASSERT(ds4_infer_recv_request(sv[1], bytes, &out, &got_suffix,
+                                       err, sizeof(err)) == 0);
+    TEST_ASSERT(out.version == in.version);
+    TEST_ASSERT(out.request_id == in.request_id);
+    TEST_ASSERT(out.flags == in.flags);
+    TEST_ASSERT(out.prefix_hash == in.prefix_hash);
+    TEST_ASSERT(out.suffix_bytes == in.suffix_bytes);
+    TEST_ASSERT(out.n_predict == in.n_predict);
+    TEST_ASSERT(out.temperature == in.temperature);
+    TEST_ASSERT(out.top_k == in.top_k);
+    TEST_ASSERT(out.top_p == in.top_p);
+    TEST_ASSERT(out.min_p == in.min_p);
+    TEST_ASSERT(out.seed == in.seed);
+    TEST_ASSERT(got_suffix && !strcmp(got_suffix, suffix));
+    free(got_suffix);
+
+    /* Hand-built raw frame pins the documented on-wire layout: any codec or
+     * struct-packing drift breaks this, not just symmetric roundtrips. */
+    uint8_t raw[12 + 56 + 3];
+    test_infer_be32(raw + 0, 0x44533449u); /* magic DS4I */
+    test_infer_be32(raw + 4, 1u);          /* MSG_INFER */
+    test_infer_be32(raw + 8, 56u + 3u);
+    uint32_t temp_bits, top_p_bits, min_p_bits;
+    float tf = 1.0f, pf = 0.5f, mf = 0.0f;
+    memcpy(&temp_bits, &tf, 4);
+    memcpy(&top_p_bits, &pf, 4);
+    memcpy(&min_p_bits, &mf, 4);
+    test_infer_be32(raw + 12, 1u);           /* version */
+    test_infer_be32(raw + 16, 0u);           /* request_hi */
+    test_infer_be32(raw + 20, 7u);           /* request_lo */
+    test_infer_be32(raw + 24, 1u);           /* flags = CACHE_ONLY */
+    test_infer_be32(raw + 28, 0xcbf29ce4u);  /* prefix_hash_hi */
+    test_infer_be32(raw + 32, 0x84222325u);  /* prefix_hash_lo */
+    test_infer_be32(raw + 36, 3u);           /* suffix_bytes */
+    test_infer_be32(raw + 40, 0u);           /* n_predict */
+    test_infer_be32(raw + 44, temp_bits);
+    test_infer_be32(raw + 48, 0u);           /* top_k */
+    test_infer_be32(raw + 52, top_p_bits);
+    test_infer_be32(raw + 56, min_p_bits);
+    test_infer_be32(raw + 60, 0u);           /* seed_hi */
+    test_infer_be32(raw + 64, 0u);           /* seed_lo */
+    memcpy(raw + 68, "abc", 3);
+    TEST_ASSERT(write(sv[0], raw, sizeof(raw)) == (ssize_t)sizeof(raw));
+
+    TEST_ASSERT(ds4_infer_read_frame_header(sv[1], &type, &bytes,
+                                            err, sizeof(err)) == 1);
+    TEST_ASSERT(type == DS4_INFER_MSG_INFER && bytes == 59u);
+    TEST_ASSERT(ds4_infer_recv_request(sv[1], bytes, &out, &got_suffix,
+                                       err, sizeof(err)) == 0);
+    TEST_ASSERT(out.request_id == 7ull);
+    TEST_ASSERT(out.flags == DS4_INFER_F_CACHE_ONLY);
+    TEST_ASSERT(out.prefix_hash == DS4_INFER_EMPTY_PREFIX_HASH);
+    TEST_ASSERT(out.n_predict == 0);
+    TEST_ASSERT(out.temperature == 1.0f);
+    TEST_ASSERT(out.top_p == 0.5f);
+    TEST_ASSERT(out.min_p == 0.0f);
+    TEST_ASSERT(got_suffix && !strcmp(got_suffix, "abc"));
+    free(got_suffix);
+
+    close(sv[0]);
+    close(sv[1]);
+}
+
+static void test_infer_result_roundtrip(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+
+    ds4_infer_result in = {0};
+    in.request_id = 0xdeadbeefcafef00dull;
+    in.result_hash = 0x85944171f73967e8ull;
+    in.status = 0;
+    in.finish_reason = DS4_INFER_FINISH_EOS;
+    in.prompt_tokens = 1200;
+    in.cached_tokens = 1000;
+    in.generated_tokens = 2;
+    in.stored = 1;
+    in.text_bytes = 5;
+    TEST_ASSERT(ds4_infer_send_result(sv[0], &in, "hi ok") == 0);
+
+    ds4_infer_result out;
+    char *text = NULL;
+    char err[160];
+    TEST_ASSERT(ds4_infer_recv_result(sv[1], &out, &text,
+                                      err, sizeof(err)) == 1);
+    TEST_ASSERT(out.request_id == in.request_id);
+    TEST_ASSERT(out.result_hash == in.result_hash);
+    TEST_ASSERT(out.status == 0);
+    TEST_ASSERT(out.finish_reason == DS4_INFER_FINISH_EOS);
+    TEST_ASSERT(out.prompt_tokens == 1200);
+    TEST_ASSERT(out.cached_tokens == 1000);
+    TEST_ASSERT(out.generated_tokens == 2);
+    TEST_ASSERT(out.stored == 1);
+    TEST_ASSERT(text && !strcmp(text, "hi ok"));
+    free(text);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+static void test_infer_error_result(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    TEST_ASSERT(ds4_infer_send_error(sv[0], 42, "unknown prefix hash") == 0);
+    ds4_infer_result out;
+    char *text = NULL;
+    char err[160];
+    TEST_ASSERT(ds4_infer_recv_result(sv[1], &out, &text,
+                                      err, sizeof(err)) == 1);
+    TEST_ASSERT(out.request_id == 42ull);
+    TEST_ASSERT(out.status == 1);
+    TEST_ASSERT(text && !strcmp(text, "unknown prefix hash"));
+    free(text);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+static void test_infer_recv_rejects_bad_version_flags_nul(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    uint32_t type = 0, bytes = 0;
+    char err[160];
+    ds4_infer_request out;
+    char *suffix = NULL;
+
+    /* Bad version: soft error, request id still echoed. */
+    ds4_infer_request bad = test_infer_sample_request();
+    bad.version = 99;
+    bad.suffix_bytes = 2;
+    TEST_ASSERT(ds4_infer_send_request(sv[0], &bad, "xy") == 0);
+    TEST_ASSERT(ds4_infer_read_frame_header(sv[1], &type, &bytes,
+                                            err, sizeof(err)) == 1);
+    TEST_ASSERT(ds4_infer_recv_request(sv[1], bytes, &out, &suffix,
+                                       err, sizeof(err)) == 1);
+    TEST_ASSERT(out.request_id == bad.request_id);
+    TEST_ASSERT(suffix == NULL);
+    TEST_ASSERT(strstr(err, "version") != NULL);
+
+    /* Bad flags: soft error. */
+    bad = test_infer_sample_request();
+    bad.flags = 0x80000000u;
+    bad.suffix_bytes = 2;
+    TEST_ASSERT(ds4_infer_send_request(sv[0], &bad, "xy") == 0);
+    TEST_ASSERT(ds4_infer_read_frame_header(sv[1], &type, &bytes,
+                                            err, sizeof(err)) == 1);
+    TEST_ASSERT(ds4_infer_recv_request(sv[1], bytes, &out, &suffix,
+                                       err, sizeof(err)) == 1);
+    TEST_ASSERT(strstr(err, "flags") != NULL);
+
+    /* Embedded NUL: soft error. */
+    bad = test_infer_sample_request();
+    bad.suffix_bytes = 3;
+    TEST_ASSERT(ds4_infer_send_request(sv[0], &bad, "a\0b") == 0);
+    TEST_ASSERT(ds4_infer_read_frame_header(sv[1], &type, &bytes,
+                                            err, sizeof(err)) == 1);
+    TEST_ASSERT(ds4_infer_recv_request(sv[1], bytes, &out, &suffix,
+                                       err, sizeof(err)) == 1);
+    TEST_ASSERT(strstr(err, "NUL") != NULL);
+
+    /* Each soft error drained its frame: a valid request still parses. */
+    ds4_infer_request good = test_infer_sample_request();
+    TEST_ASSERT(ds4_infer_send_request(sv[0], &good, "hello\n") == 0);
+    TEST_ASSERT(ds4_infer_read_frame_header(sv[1], &type, &bytes,
+                                            err, sizeof(err)) == 1);
+    TEST_ASSERT(ds4_infer_recv_request(sv[1], bytes, &out, &suffix,
+                                       err, sizeof(err)) == 0);
+    TEST_ASSERT(suffix && !strcmp(suffix, "hello\n"));
+    free(suffix);
+
+    close(sv[0]);
+    close(sv[1]);
+}
+
+static void test_infer_listen_endpoint_unix(void) {
+    char tmpl[] = "/tmp/ds4-infer-uds-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+    char spec[128];
+    snprintf(spec, sizeof(spec), "unix:%s/infer.sock", dir);
+
+    char err[160];
+    TEST_ASSERT(ds4_infer_endpoint_is_unix(spec));
+    TEST_ASSERT(!ds4_infer_endpoint_is_unix("127.0.0.1:9000"));
+    int lfd = ds4_infer_listen_endpoint(spec, err, sizeof(err));
+    TEST_ASSERT(lfd >= 0);
+
+    int cfd = ds4_infer_connect_endpoint(spec, err, sizeof(err));
+    TEST_ASSERT(cfd >= 0);
+    int afd = accept(lfd, NULL, NULL);
+    TEST_ASSERT(afd >= 0);
+    ds4_infer_socket_prepare(afd, true);
+
+    ds4_infer_request req = test_infer_sample_request();
+    TEST_ASSERT(ds4_infer_send_request(cfd, &req, "hello\n") == 0);
+    uint32_t type = 0, bytes = 0;
+    ds4_infer_request out;
+    char *suffix = NULL;
+    TEST_ASSERT(ds4_infer_read_frame_header(afd, &type, &bytes,
+                                            err, sizeof(err)) == 1);
+    TEST_ASSERT(ds4_infer_recv_request(afd, bytes, &out, &suffix,
+                                       err, sizeof(err)) == 0);
+    TEST_ASSERT(suffix && !strcmp(suffix, "hello\n"));
+    free(suffix);
+
+    close(cfd);
+    close(afd);
+    close(lfd);
+
+    /* The socket file is still on disk; a fresh listener must recover it. */
+    int lfd2 = ds4_infer_listen_endpoint(spec, err, sizeof(err));
+    TEST_ASSERT(lfd2 >= 0);
+    close(lfd2);
+    unlink(spec + 5);
+    rmdir(dir);
+}
+
 static void test_kv_cache_lookup_uses_longest_text_prefix(void) {
     char tmpl[] = "/tmp/ds4-kv-text-prefix-test.XXXXXX";
     char *dir = mkdtemp(tmpl);
@@ -17931,6 +18187,11 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_lookup_uses_longest_text_prefix();
     test_kv_cache_fnv_naming_lookup_integrity();
     test_kv_cache_scan_accepts_both_name_shapes();
+    test_infer_frame_roundtrip();
+    test_infer_result_roundtrip();
+    test_infer_error_result();
+    test_infer_recv_rejects_bad_version_flags_nul();
+    test_infer_listen_endpoint_unix();
     test_kv_cache_lookup_rejects_wrong_model();
     test_kv_cache_lookup_rejects_stale_payload_abi();
     test_kv_cache_eviction_values_fresh_snapshots();

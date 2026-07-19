@@ -122,4 +122,13 @@ int ds4_dist_session_load_payload(
  */
 int ds4_dist_run(ds4_engine *engine, const ds4_dist_options *opt, const ds4_dist_generation_options *gen);
 
+/* Low-level socket/IO primitives shared with the DS4I client protocol
+ * (ds4_infer.c).  write/read_full: 0/-1; read_full returns 0 on clean EOF,
+ * 1 on success. */
+int ds4_dist_io_write_full(int fd, const void *buf, size_t len);
+int ds4_dist_io_read_full(int fd, void *buf, size_t len);
+int ds4_dist_io_listen_tcp(const char *host, int port, char *err, size_t errlen);
+int ds4_dist_io_connect_tcp(const char *host, int port, char *err, size_t errlen);
+int ds4_dist_io_set_low_latency(int fd);
+
 #endif

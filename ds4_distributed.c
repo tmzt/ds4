@@ -8426,3 +8426,33 @@ int ds4_dist_run(ds4_engine *engine, const ds4_dist_options *opt, const ds4_dist
     fprintf(stderr, "ds4: distributed runtime requested without a distributed role\n");
     return 1;
 }
+
+/* =========================================================================
+ * Shared Socket/IO Primitives
+ * =========================================================================
+ *
+ * Thin public wrappers over the static transport helpers, used by the DS4I
+ * client protocol (ds4_infer.c) so it never re-implements TCP setup or the
+ * full-write/full-read discipline.  The DS4D frame codec itself stays
+ * private: DS4I frames carry their own magic.
+ */
+
+int ds4_dist_io_write_full(int fd, const void *buf, size_t len) {
+    return dist_write_full(fd, buf, len);
+}
+
+int ds4_dist_io_read_full(int fd, void *buf, size_t len) {
+    return dist_read_full(fd, buf, len);
+}
+
+int ds4_dist_io_listen_tcp(const char *host, int port, char *err, size_t errlen) {
+    return dist_open_listener(host, port, err, errlen);
+}
+
+int ds4_dist_io_connect_tcp(const char *host, int port, char *err, size_t errlen) {
+    return dist_connect_endpoint(host, port, err, errlen);
+}
+
+int ds4_dist_io_set_low_latency(int fd) {
+    return dist_set_socket_low_latency(fd);
+}
